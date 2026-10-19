@@ -1,0 +1,307 @@
+# PacketSentry
+
+> 面向 **SRC / 众测** 的 Burp Suite 扩展：被动观察业务流量，本地识别业务逻辑漏洞，并且**保证目标数据不出本机**。
+
+**v3.9.0** · Java 21 · 30 个类 / 17,300+ 行 · 32 个测试套件 / 721 条断言全通过
+
+---
+
+## 它解决什么问题
+
+挖 SRC 时的真实困难不是"找不到漏洞扫描器"，而是：
+
+1. **业务逻辑漏洞扫不出来** —— 越权、金额篡改、状态机绕过，这些没有特征串，靠的是理解"这个接口本该做什么"。
+2. **流量太多，看不完** —— 一次浏览几百个请求，哪些值得深挖？
+3. **发现的漏洞记不住** —— 一天挖 5 个，三天后自己都忘了哪个验证过、哪个提交了。
+4. **想让 AI 帮忙，但不敢把客户数据发出去** —— 这是最要命的一条。
+
+**PacketSentry 的目标是这四条，而不是"再做一个扫描器"。**
+
+---
+
+## ⚠️ 它**不**做的事（先说清楚边界）
+
+| 不做 | 为什么 |
+|---|---|
+| **不主动爬取 / 不扫目录 / 不爆破** | 那会在目标 WAF 日志里留下一串请求。**你浏览过什么，就只分析什么。** |
+| **不自动发送攻击 payload** | 唯一会发请求的功能是「批量越权」，且默认只允许 GET/HEAD/OPTIONS、400ms 间隔、需要二次确认 |
+| **不内置 CVE 数据库** | 版本区间写错会直接导致一次**错误的报告提交**，代价比没有这个功能更大。CVE 规则由用户核实后填写 |
+| **不保证 100% 脱敏** | 新形态凭据可能不在规则里。工具降低风险，责任仍在使用者 |
+
+---
+
+## 快速上手
+
+### 1. 安装
+
+```
+Burp Suite → Extender → Extensions → Add
+  Extension type   Java
+  Extension file   dist/PacketSentry-3.9.0.jar
+```
+
+载入后 Output 会打印加载横幅。**不需要重启 Burp。**
+
+> **兼容性说明：** Burp v2025.2 起，扩展入口的调用顺序变为
+> `registerExtenderCallbacks` → `initialize(MontoyaApi)`。
+> 本插件以 **Montoya API 为准**注册主标签页，同时保留一条 legacy `ITab`
+> 的 1500ms 定时器兜底 —— 见 [DESIGN.md](DESIGN.md#1-为什么同时注册-montoya-和-legacy-两条通道)。
+
+### 2. 配模型
+
+**设置页 → 选服务商。** 默认 Ollama（本地 / 数据不出机器）。
+
+| 服务商 | 地址 | 数据去向 |
+|---|---|---|
+| **Ollama**（推荐） | `http://127.0.0.1:11434/v1` | **不出机器** |
+| LM Studio | `http://127.0.0.1:1234/v1` | **不出机器** |
+| vLLM | `http://127.0.0.1:8000/v1` | **不出机器** |
+| DeepSeek / 通义 / 智谱 / Kimi | 见预设 | 云端 |
+
+**本地模型配置（8GB 显存可用）：**
+
+```bash
+ollama pull qwen3:8b     # 4.87 GB Q4_K_M，RTX 4060 实测 45 tokens/s
+```
+
+> **显存参考：** 8B ≈ 5 GB Q4（8GB 显存够）；14B ≈ 9-10 GB（8GB 装不下，会掉到 1-3 tokens/s）。
+> 插件在开启 SRC 模式时会把默认模型设为 `qwen3:8b` —— **不是为了性能妥协，而是因为默认值必须能在常见硬件上跑起来。**
+
+**Key 优先读环境变量，不落盘：**
+
+```powershell
+[Environment]::SetEnvironmentVariable('PACKETSENTRY_API_KEY','sk-xxxx','User')
+```
+
+---
+
+## 功能
+
+### 实时抓包 · 业务流量地图
+
+被动接收 Proxy/Repeater/Intruder 的流量，本地推断业务作用（「获取用户信息」「加载脚本」「下单」），按危险等级给列表着色。
+
+- **结构签名去重** —— 同一个接口调用 300 次只分析 1 次
+- **原始报文不上盘、不发网络** —— `IHttpListener` 只计数与入队
+
+### 发现清单（核心产出）
+
+**⭐ 报文是过程，发现才是成果。**
+
+每条发现带状态机：`待验证 → 已验证 → 已提交 → 已收录 / 已忽略 / 不收 / 弃用`
+
+- **降噪指纹** —— 用归一化路径，5 个 ID 验证同一个越权只会合并成 1 条（`seenCount ×5`）
+- **`/api/v1` 和 `/api/v2` 保持分离** —— 版本段不做归一化（否则漏掉真实差异）
+- 持久化到 `~/.packetsentry/findings.json`（原子写入）
+- **只有「已验证及以上」才导出报告**
+
+### 批量越权测试
+
+**⚠️ 这是唯一会向目标发送请求的功能，因此限制最严。**
+
+| 约束 | 值 | 理由 |
+|---|---|---|
+| 默认方法 | `GET` / `HEAD` / `OPTIONS` | 写方法（POST 下单等）**默认禁止** |
+| 写方法 | 需要二次红色确认 | 重放 `POST /order/create` 可能**真的会创建订单** |
+| 间隔 | 400 ms | 不构成扫描压力 |
+| 身份 | 用户自己的凭据 | 只用你已有的会话，不生成凭据 |
+
+**它为什么不是"扫描器"：** 它只重放**用户自己已经发过**的请求，换一个**用户自己的**身份。不会构造新请求、不会遍历 ID、不会爆破。
+
+判定用结构与值的双相似度（Jaccard），区分 `VULNERABLE / PROTECTED / SEPARATE / INCONCLUSIVE`。
+
+### 组件指纹 × CVE × 资产
+
+从已抓响应里提取组件版本（30 条规则），把同一指纹的资产归组，再匹配用户填写的 CVE 区间。
+
+- **纯观测** —— 0 个网络请求
+- **版本比较是逐段数值比较** —— `1.9 < 1.10` ✓（字符串比较会得出错误结论）
+- **不内置 CVE 库** —— 见上方边界说明
+
+### 代码审计 / 反射检测 / 隐藏入口
+
+- **代码审计**（9 类）—— 三类结论：`🔴 有发现 / 🟡 有可能 / ⚪ 无`，**并且说明"为什么无"**
+- **反射与上下文检测** —— 15 种上下文（HTML 文本 / 属性 / JS 字符串 / 模板串 / 事件处理器…），给出对应 payload 与探测方法
+- **隐藏入口审计** —— 从 JS/HTML **注释**里找被注释掉但未删除的路径（`/admin/panel` 这类）
+
+### SRC 平台规则过滤
+
+粘贴平台的收录规则，插件解析成 4 状态判定：
+
+```
+收  /  视影响  /  不收  /  未提及
+```
+
+- **过滤发生在显示层** —— 开关规则时立刻重算，不需要重新抓包
+- **`stripExcludedRegions` 先跑** —— 否则「XX 漏洞不在收录范围」里的关键词会污染收录判断
+- 低危但**平台收**的漏洞**照常显示**（定级仍然给出）
+
+### 报告生成
+
+URL / 风险评级 / 危害说明 / 资产归属证明 / 渗透路径 / 修复建议。
+
+**5 种平台字段模板：** `generic（六段式）` / `butian` / `edu` / `hackerone` / `enterprise`
+
+- 字段映射基于关键词，**改名字仍然有效**
+- **URL 和风险评级有硬兜底** —— 即使模板字段名完全陌生，报告里也一定会出现这两项
+- 每个模板都标注「按平台实际字段调整」—— 平台表单会变，不声称权威
+
+### OWASP Top 10 : 2025 覆盖度
+
+**刻意不做"已覆盖全部"这种表述。** 被动观察在结构上就看不到注入 / SSRF / 日志监控这几类，插件把它们明确标出来，让你知道该用什么别的办法。
+
+---
+
+## 安全设计
+
+### SRC 安全模式
+
+开启后强制：**本地服务商 + 全量掩码 + 三层脱敏 + 扫描开启**。
+
+```
+┌─ 数据流向 ────────────────────────────────────┐
+│  报文 → 本地扫描 → 脱敏 → [你确认] → 出本机   │
+│           ↑ 零网络        ↑ 可编辑    ↑ 此处  │
+└───────────────────────────────────────────────┘
+```
+
+**⭐ 出口检查是 fail-closed 的，而且在网络层而非 UI 层。**
+即使 UI 有 bug 把云端服务商漏进来，`LlmClient.chat()` 仍会在发请求前拒绝，响应时间 <500ms 且**不产生任何网络调用**。
+
+**⭐ SRC 模式不允许云端服务商，这是定义决定的。**
+把目标流量发给云端 LLM，**即使脱敏**，泄露的仍是域名、路径、参数名、响应结构 —— 那本身就是业务信息。**想用云端就关掉 SRC 模式**（脱敏依然生效）。两件事是独立的。
+
+### 三层脱敏
+
+```
+第 1 层  头白名单      authorization / cookie / x-api-key / x-csrf-token …
+第 2 层  字段名匹配    password / id_card / bank_card / phone / private_key …
+第 3 层  值级正则      PEM 私钥 / JWT / AWS 密钥 / 身份证 / 手机号 / 银行卡
+```
+
+**掩码策略：** `KEEP_EDGES`（默认，`Bear****sw5c`）/ `FULL` / `HASH` / `TYPE_ONLY`
+
+### 信任边界加固
+
+`Identity.apply()` 会把用户配置的身份凭据注入到报文里 —— **这是把用户输入拼进 HTTP 头，是典型的注入面。**
+
+已加固：
+- **值清理** —— CRLF → 空格，剥离控制字符（防**头注入**）
+- **名校验** —— RFC 7230 token 正则，非法名返回 `null`（防**头重定向**）
+- **发现非法输入时弹确认框**，而不是静默注入
+
+---
+
+## 从源码构建
+
+### 先准备依赖
+
+**⚠️ `lib/` 里只有 Gson 是随仓库分发的。**
+
+两个 Burp API jar 是 PortSwigger 的**专有产物**，不能随仓库分发 —— 需要你自行获取。
+**获取方式见 [`lib/README.md`](lib/README.md)**（从 Burp 的 Extender → APIs 里 Save jar 最快）。
+
+```
+lib/
+  gson-2.11.0.jar              ✅ 随仓库分发（Apache-2.0）
+  montoya-api.jar              ⚠️ 自行获取（PortSwigger 专有）
+  burp-extender-api-2.3.jar    ⚠️ 自行获取（PortSwigger 专有）
+```
+
+### 编译与打包
+
+```bash
+javac -encoding UTF-8 -cp "lib/*" -d out $(find src -name '*.java')
+
+# 打包：插件类 + Gson（Burp 只加载单个 jar）
+jar --create --file dist/PacketSentry-3.9.0.jar \
+    --manifest src/META-INF/MANIFEST.MF -C stage .
+```
+
+**⭐ 打包铁律（发布前必查）：**
+
+```bash
+jar --list --file dist/PacketSentry-3.9.0.jar | grep '^burp/'
+# 输出必须为空 —— 打包进 Burp API 会导致类加载冲突
+```
+
+产物里应该只有 `com/packetsentry/**`、`com/google/gson/**` 和 `META-INF/`。
+
+---
+
+## 测试
+
+```bash
+# 32 个套件，721 条断言
+for t in SanitizerProbe PiiScannerProbe LoadTest RealtimeProbe LocalRulesProbe \
+         AccessControlProbe SrcModeProbe LogicHintsProbe EgressGuardProbe \
+         AuditReportProbe PlatformRulesProbe RobustnessProbe ContractProbe \
+         RouteAuditProbe ConcurrencyProbe SemanticProbe ResourceProbe \
+         TrustBoundaryProbe ReflectionProbe SrcFeedbackProbe FindingsProbe \
+         SrcToolsProbe ProviderProbe NewCodeProbe KeepAliveProbe \
+         ThemeProbe FontFixProbe SymbolProbe ButtonProbe \
+         ReportGateProbe OomDiagnoseProbe; do
+  java -Djava.awt.headless=true -cp "out:lib/*" $t || echo "FAIL: $t"
+done
+```
+
+**部分套件不是形式主义：**
+
+- **`LoadTest`** 用动态代理伪造 `IBurpExtenderCallbacks`，**真的走一遍** `registerExtenderCallbacks()` —— 抓出过 `GridBagLayout` 约束误用导致 `buildUi` 中断、主标签页根本没注册的 bug
+- **`EgressGuardProbe`** 断言 SRC 模式下云端服务商被拒绝，且**耗时 <500ms、零网络调用**
+- **`TrustBoundaryProbe`** 断言 CRLF 注入和头重定向都被挡住
+- **`RobustnessProbe`** 用 **min** 而非中位数/绝对值做性能断言 —— 绝对耗时随机器负载在 176ms ↔ 579ms 之间漂移，只有 min 是无偏估计
+- **`KeepAliveProbe`** 断言 `keep_alive` 的 JSON **类型**（必须是数字）—— 抓出过一次「测试全绿但连接失败」的线上故障，见 DESIGN.md 第 15 条
+
+> **⚠️ 一个必须承认的空白：这 25 个套件没有一条真的连过 Ollama。**
+> 它们能证明逻辑正确，但证明不了能和真实服务对话。补这个空白需要一台真实服务。
+
+---
+
+## 报告准入 · 黄金六要素
+
+生成报告和批量导出时，插件会先用本地规则自检一遍，**缺什么就说缺什么**：
+
+| # | 要素 | 反的是哪种坏报告 |
+|---|---|---|
+| 1 | 目标与版本 | 版本模糊 |
+| 2 | 完整复现步骤 | PoC 半截 |
+| 3 | 明确观测结果 | 薛定谔漏洞 |
+| 4 | 具体影响描述 | 量子态危害 |
+| 5 | 人工实测确认 | 文字幻觉体 |
+| 6 | 完整证据 | 截图半张 |
+
+**五类直接打回**：文字幻觉体 / 时空错位型 / 拼贴怪 / 薛定谔漏洞 / 量子态危害。
+
+> ⚠️ 闸门只回答「够不够格提交」，**不回答「漏洞是否成立」** —— 后者只能靠人实测。
+> 它也只提示、不拦截：拦下来反而会挡住你真正想提交的东西。
+
+**⭐ 闸门刻意放在 AI 补齐之前** —— 如果先让 AI 润色，它会很自然地把缺失的信息
+用流畅的话补上，而那正是「文字幻觉体」的来源。
+
+## 已知限制
+
+| 限制 | 影响 | 状态 |
+|---|---|---|
+| 主动扫描类漏洞（注入/SSRF）看不到 | 结构限制，已在 OWASP 页面明示 | 设计如此 |
+| CVE 规则需手动填写 | 内置会带来错误提交风险 | 设计如此 |
+| 平台收录规则需粘贴 | 各平台规则会变，无法内置 | 设计如此 |
+| 本地 8B 模型单包分析约 1000 tokens / 20 秒 | 本地推理的固有限制 | — |
+
+---
+
+## 许可与免责
+
+**本工具仅供已获授权的安全测试使用。**
+
+使用前请确认：
+1. 你对目标系统**有书面授权**
+2. 你的**合同允许**把（脱敏后的）数据发给所选 AI 服务商
+
+> **工具降低风险，责任仍在使用者。**
+
+---
+
+## 相关文档
+
+- **[DESIGN.md](DESIGN.md)** —— 设计权衡记录：14 个关键决策的取舍与踩过的坑

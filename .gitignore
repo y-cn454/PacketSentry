@@ -1,0 +1,39 @@
+# 构建产物
+out/
+stage/
+_s*/
+_gg*/
+*.class
+
+# ⚠️ 不要提交这两个 jar —— 它们是 PortSwigger 的专有产物
+#    见 lib/README.md 说明如何自行获取
+lib/montoya-api.jar
+lib/burp-extender-api-2.3.jar
+
+# 测试运行产生的临时文件
+_x.txt
+_y.txt
+_nc.txt
+_sm.txt
+**/findings.json
+unmapped-report.txt
+
+# 编辑器
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# 系统
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# JVM 崩溃 / replay 日志（OOM 排查时会生成，不该进仓库）
+hs_err_pid*.log
+replay_pid*.log
+
+# 本地调试产物
+_sym*.txt
+symbol-report.txt
+*.log
