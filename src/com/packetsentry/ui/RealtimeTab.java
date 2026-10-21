@@ -27,14 +27,17 @@ import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
+import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
+import javax.swing.JSeparator;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.ListSelectionModel;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.table.AbstractTableModel;
 import javax.swing.table.DefaultTableCellRenderer;
@@ -242,6 +245,70 @@ public final class RealtimeTab extends JPanel {
         th.start();
     }
 
+    // ==================== 工具栏排版 ====================
+    //
+    // ⚠️ 这块不是「美化」，是修一个真实的渲染 bug。
+    //
+    //   原来只给下拉框设了 setMaximumSize，<b>没设 setPreferredSize</b>。
+    //   而 BoxLayout 是按【首选尺寸】摆放的，JComboBox 的首选宽度又由当前
+    //   内容算出来 —— "全部" 这种两字选项只有几十像素。于是下拉框被压到
+    //   极窄，编辑区和右侧箭头重叠成一团（截图里那个"1∨"）。
+    //
+    //   另外三个控件（JButton / JComboBox / JTextField）默认高度分别是
+    //   31 / 32 / 23，混在同一个 X_AXIS 里必然参差不齐。
+    //
+    //   所以规则是：
+    //     · 下拉框、输入框 —— 锁【宽 + 高】，宽度必须显式给
+    //     · 按钮、复选 —— 只锁【高】，宽度留给 L&F 按字体算
+    //       （锁死按钮宽度的话，主题换字体后文字会被裁掉）
+
+    /** 工具栏控件的统一高度。取自实测：最高的 JComboBox 是 32。 */
+    private static final int BAR_H = 32;
+
+    /** 锁宽高的控件（下拉框 / 输入框）。 */
+    private static <T extends JComponent> T barSize(T c, int w) {
+        Dimension d = new Dimension(w, BAR_H);
+        c.setPreferredSize(d);
+        c.setMinimumSize(d);
+        c.setMaximumSize(d);
+        return c;
+    }
+
+    /** 只锁高度，宽度保持 L&F 计算结果。 */
+    private static <T extends JComponent> T barH(T c) {
+        c.setMinimumSize(new Dimension(0, BAR_H));
+        c.setMaximumSize(new Dimension(Integer.MAX_VALUE, BAR_H));
+        return c;
+    }
+
+    /**
+     * 组间竖线分隔。
+     *
+     * <p>BoxLayout 里分隔线必须给固定尺寸：不给的话它的最大尺寸是
+     * {@code Integer.MAX_VALUE}，会被拉去占满剩余空间或压成一条看不见的线。
+     */
+    private static JComponent barSep() {
+        JSeparator sep = new JSeparator(SwingConstants.VERTICAL);
+        Dimension d = new Dimension(11, BAR_H - 8);
+        sep.setPreferredSize(d);
+        sep.setMinimumSize(d);
+        sep.setMaximumSize(d);
+        return sep;
+    }
+
+    /**
+     * 工具栏标签。
+     *
+     * <p>只做一件事：不再靠尾部空格当间距。原来写的是 {@code "目标域名 "}，
+     * 尾部空格在等宽字体下宽度固定、换字体就会变，两行对不齐。
+     * 间距统一交给 {@code Box.createHorizontalStrut}。
+     *
+     * <p>颜色不在这里设 —— {@code Theme.apply()} 会统一刷 JLabel 前景色。
+     */
+    private static JLabel barLabel(String text) {
+        return new JLabel(text);
+    }
+
     /**
      * 发现清单 —— SRC 工作的载体。
      *
@@ -282,7 +349,12 @@ public final class RealtimeTab extends JPanel {
         row1.setLayout(new BoxLayout(row1, BoxLayout.X_AXIS));
         row1.setBorder(BorderFactory.createEmptyBorder(4, 6, 0, 6));
 
-        hostBox.setMaximumSize(new Dimension(280, 26));
+        // 宽度必须显式给（见 BAR_H 那段说明）
+        barSize(hostBox, 230);
+        // ⚠️ 必须先放一个哨兵项：refreshHostBox() 只在抓到流量后才被调用，
+        //    否则首次打开面板时这个下拉框是**空白框** —— 看起来像坏了。
+        //    加了这一项，「没抓包」和「不过滤」两种状态长得一样，都是 (全部)。
+        hostBox.addItem("(全部)");
         hostBox.setToolTipText("只显示该域名的流量；宏观分析也针对该域名");
         hostBox.addActionListener(e -> onHostSelected());
         huntBtn.setToolTipText(
@@ -353,20 +425,24 @@ public final class RealtimeTab extends JPanel {
         //      · 报告生成（按 OWASP 分类归组）
         //    见 onHuntResult() 与 ReportGenerator。
 
-        row1.add(new JLabel("目标域名 "));
+        // ── 分组 1：目标过滤 ──
+        row1.add(barLabel("目标域名"));
+        row1.add(Box.createHorizontalStrut(5));
         row1.add(hostBox);
-        row1.add(Box.createHorizontalStrut(6));
-        row1.add(macroLocalBtn);
+        row1.add(barSep());
+        // ── 分组 2：业务地图 ──
+        row1.add(barH(macroLocalBtn));
         row1.add(Box.createHorizontalStrut(4));
-        row1.add(macroAiBtn);
-        row1.add(Box.createHorizontalStrut(10));
-        row1.add(routeAuditBtn);
+        row1.add(barH(macroAiBtn));
+        row1.add(barSep());
+        // ── 分组 3：本地审计 ──
+        row1.add(barH(routeAuditBtn));
         row1.add(Box.createHorizontalStrut(4));
-        row1.add(reflectBtn);
+        row1.add(barH(reflectBtn));
         row1.add(Box.createHorizontalStrut(4));
-        row1.add(domainAuditBtn);
-        row1.add(Box.createHorizontalStrut(10));
-        row1.add(clearBtn);
+        row1.add(barH(domainAuditBtn));
+        row1.add(barSep());
+        row1.add(barH(clearBtn));
         row1.add(Box.createHorizontalGlue());
 
         // ★ 「发现清单」放在最右、独立分组 —— 它不是一个分析动作，
@@ -377,7 +453,8 @@ public final class RealtimeTab extends JPanel {
                         + "可跟踪状态（待验证/已验证/已提交/已收录/不收）、导出 Markdown 报告。"
                         + " 存于 ~/.packetsentry/findings.json");
         findingsBtn.addActionListener(e -> showFindings());
-        row1.add(findingsBtn);
+        // ── 分组 4：SRC 台账（发现 / 批量越权 / CVE）──
+        row1.add(barH(findingsBtn));
         row1.add(Box.createHorizontalStrut(4));
 
         // ★ SRC 场景的两个高频动作：批量越权、CVE 跨资产匹配
@@ -387,7 +464,7 @@ public final class RealtimeTab extends JPanel {
                         + " 默认只测只读方法（GET/HEAD/OPTIONS），"
                         + "写操作需二次确认（重放写操作可能真的改数据）");
         acBatchBtn.addActionListener(e -> runBatchAccessControl());
-        row1.add(acBatchBtn);
+        row1.add(barH(acBatchBtn));
         row1.add(Box.createHorizontalStrut(4));
 
         JButton cveBtn = new JButton("CVE 匹配");
@@ -397,10 +474,14 @@ public final class RealtimeTab extends JPanel {
                         + " 纯被动分析，0 网络请求");
         cveBtn.addActionListener(e -> showCveMatch());
         guardButton("cve", cveBtn);
-        row1.add(cveBtn);
-        row1.add(localHuntBtn);
-        row1.add(huntBtn);
-        row1.add(reviewBtn);
+        row1.add(barH(cveBtn));
+        row1.add(barSep());
+        // ── 分组 5：挖洞 ──
+        row1.add(barH(localHuntBtn));
+        row1.add(Box.createHorizontalStrut(4));
+        row1.add(barH(huntBtn));
+        row1.add(Box.createHorizontalStrut(4));
+        row1.add(barH(reviewBtn));
         add(row1, BorderLayout.NORTH);
 
         // ---------- 第 2 行：微观控制 ----------
@@ -412,7 +493,15 @@ public final class RealtimeTab extends JPanel {
         autoBox.addActionListener(e -> onAutoChanged());
 
         budgetField.setText("1.0");
-        budgetField.setMaximumSize(new Dimension(60, 24));
+        // ⚠️ JTextField 不能像下拉框那样用 setPreferredSize 定宽。
+        //    JTextField.getPreferredSize() 会【按 columns 和当前字体重算】，
+        //    直接忽略 setPreferredSize。实测：barSize(54) 之后首选宽度仍是 59，
+        //    反而超过 max=54，被 BoxLayout 裁回 54 —— 数字末尾被切掉，
+        //    就是截图里那个只剩 "1" 的小框。
+        //    正确做法：columns 定宽，只锁高度。
+        budgetField.setColumns(4);
+        budgetField.setMinimumSize(new Dimension(44, BAR_H));
+        budgetField.setMaximumSize(new Dimension(76, BAR_H));
         budgetField.setToolTipText("累计预估花费超过这个金额（人民币）就停止自动分析");
         budgetField.addActionListener(e -> applyBudget());
 
@@ -433,7 +522,7 @@ public final class RealtimeTab extends JPanel {
         });
 
         // ---- 越权测试 ----
-        identityBox.setMaximumSize(new Dimension(170, 26));
+        barSize(identityBox, 150);
         identityBox.setToolTipText("用这个身份重放选中的请求，对比响应（需要先在设置页配置身份）");
         refreshIdentities();
 
@@ -441,7 +530,7 @@ public final class RealtimeTab extends JPanel {
         acBtn.setToolTipText("用选中的身份重放该请求，与基线响应对比 —— 会向目标发送 1 个额外请求");
         acBtn.addActionListener(e -> runAccessControlTest());
 
-        severityBox.setMaximumSize(new Dimension(150, 26));
+        barSize(severityBox, 108);
         severityBox.setToolTipText("真实目标上低危噪音很多，建议从「中危以上」看起");
         severityBox.addItem("全部");
         severityBox.addItem("低危以上");
@@ -451,21 +540,26 @@ public final class RealtimeTab extends JPanel {
         severityBox.addItem("仅无问题");
         severityBox.addActionListener(e -> applySeverityFilter());
 
-        row2.add(new JLabel("显示 "));
+        // ── 分组 1：显示过滤 ──
+        row2.add(barLabel("显示"));
+        row2.add(Box.createHorizontalStrut(5));
         row2.add(severityBox);
-        row2.add(Box.createHorizontalStrut(10));
+        row2.add(barSep());
         darkThemeBox.setToolTipText("关掉则交回 Burp 原生外观（若暗色在某些环境下显示异常）");
         darkThemeBox.addActionListener(e -> {
             Theme.setEnabled(darkThemeBox.isSelected());
             applyTheme();
         });
-        row2.add(autoBox);
-        row2.add(Box.createHorizontalStrut(10));
-        row2.add(darkThemeBox);
+        // ── 分组 2：自动分析开关 ──
+        row2.add(barH(autoBox));
         row2.add(Box.createHorizontalStrut(8));
-        row2.add(new JLabel("预算 ¥"));
+        row2.add(barH(darkThemeBox));
+        row2.add(barSep());
+        // ── 分组 3：预算 ──
+        row2.add(barLabel("预算 ¥"));
+        row2.add(Box.createHorizontalStrut(4));
         row2.add(budgetField);
-        row2.add(Box.createHorizontalStrut(12));
+        row2.add(barSep());
         JButton auditBtn = new JButton("代码审计");
         auditBtn.setToolTipText("审计选中响应里的 JS/HTML：硬编码密钥、危险DOM、接口路径、注释线索、Source Map…");
         auditBtn.addActionListener(e -> runCodeAudit());
@@ -474,20 +568,25 @@ public final class RealtimeTab extends JPanel {
         reportBtn.setToolTipText("按渗透测试报告结构生成：URL / 定级 / 危害 / 资产证明 / 渗透路径 / 修复建议");
         reportBtn.addActionListener(e -> generateReport());
 
-        row2.add(auditBtn);
+        // ── 分组 4：审计与报告 ──
+        row2.add(barH(auditBtn));
         row2.add(Box.createHorizontalStrut(4));
-        row2.add(reportBtn);
-        row2.add(Box.createHorizontalStrut(10));
-        row2.add(toRepeaterBtn);
+        row2.add(barH(reportBtn));
+        row2.add(barSep());
+        // ── 分组 5：转发与 AI 深挖 ──
+        row2.add(barH(toRepeaterBtn));
         row2.add(Box.createHorizontalStrut(4));
-        row2.add(toAiBtn);
+        row2.add(barH(toAiBtn));
         row2.add(Box.createHorizontalStrut(4));
-        row2.add(pauseBtn);
+        row2.add(barH(pauseBtn));
         row2.add(Box.createHorizontalStrut(14));
-        row2.add(new JLabel("以身份 "));
+        row2.add(barSep());
+        // ── 分组 6：越权测试 ──
+        row2.add(barLabel("以身份"));
+        row2.add(Box.createHorizontalStrut(5));
         row2.add(identityBox);
         row2.add(Box.createHorizontalStrut(4));
-        row2.add(acBtn);
+        row2.add(barH(acBtn));
         row2.add(Box.createHorizontalGlue());
 
         // ---------- 表格 ----------

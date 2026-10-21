@@ -787,96 +787,68 @@ return f.getName().equalsIgnoreCase("Monospaced")
 
 ---
 
-## 20. 耗时功能必须有**单飞守卫**，否则"再点一下"就是重复请求
+---
 
-### 现象
+## 20. 耗时功能必须有单飞守卫
 
-用户反馈三件事：
+**现象**　用户反馈「AI 挖洞一直在请求模型」「CVE 匹配 / 本地挖洞类似」。
 
-1. **「AI 挖洞一直在请求模型」**
-2. **「CVE 匹配和本地挖洞也可能存在类似 bug」**
-3. **「OWASP Top10 要结合到分析中，不要单独一个按钮」**
+**根因**　三个功能都没有防重入。点一次就起一个后台线程调 `llm.chat()`，
+而本地模型处理一份完整 prompt 要 30–120 秒，期间界面没有任何反馈 ——
+用户以为没反应就反复点，**点 5 次 = 5 个并发请求**。
+`runLocalHunting` 更糟：同步跑在 EDT 上，800 条记录冻结界面 5 秒以上。
 
-### 根因
+**做法**
 
-前两条是同一个问题：**没有防重入**。
+- `runningKeys` 用并发 Set 记录正在跑的功能；`enterGuard` 抢不到就明确拒绝
+- `runGuarded` 收敛「抢 → 起线程 → finally 释放」；`showCveMatch` 手写同款
+- 抢到后禁用按钮，跑完恢复 —— 让用户看得见"在跑"
 
-```java
-huntBtn.addActionListener(e -> runHunting());   // 每次点击都起一个新线程
-// runHunting 内部：
-//   new Thread(() -> llm.chat(cfg, SYSTEM, prompt)).start();
-// 没有「正在跑」的标记，也没有禁用按钮
-```
+**三条硬规则**
 
-本地 4B 模型处理一份完整 prompt 要 **30–120 秒**，期间界面上没有任何反馈。
-用户以为没反应就反复点 —— **点 5 次就是 5 个并发请求，每个都是全量 prompt**。
-在 Burp 的 HTTP history 里看，就是"一直在请求模型"，而本地模型会被打爆（排队 / OOM）。
+1. 守卫在**所有校验之后**才获取。否则某个早退分支（如"还没抓到流量"）
+   会把锁留在原地，按钮永久禁用。
+2. 释放必须在 `finally` 里，且要在 EDT 上。漏一次就永久禁用 ——
+   这是此类守卫最典型的 bug。
+3. `pinDetail` 放在守卫**之后**。否则重复点击会先显示"正在后台提取…"、
+   再显示"上一次还在运行"，两条矛盾提示让用户以为任务真的重启了。
 
-更糟的是 `runLocalHunting`：它是**同步跑在 EDT 上**的。
+**回归**　`GuardProbe`（29 条断言）静态守住接线。
+用静态检查而非运行期测试：这件事本质是接线问题，而构造 `RealtimeTab`
+需要 mock `IBurpExtenderCallbacks`。
 
-```java
-com.packetsentry.ai.LocalHunter.Result res =
-        com.packetsentry.ai.LocalHunter.hunt(pool);   // 800 条记录 = 5 秒以上
-```
+**一句话**　任何"点一次要等几秒到几分钟"的功能，必须同时有守卫、有反馈、不占 EDT。
 
-这 5 秒里界面完全冻住，连"正在跑"都画不出来。
+---
 
-### 决定
+## 21. 下拉框必须给显式首选宽度，按钮只锁高度
 
-引入**单飞守卫（single-flight guard）**：同一个功能同一时刻只允许一个任务。
+**现象**　截图里「目标域名」的下拉框变成一个黑块，右侧叠着「1∨」；
+「显示」的「全部」被裁掉一半。
 
-```java
-private final Set<String> runningKeys = ConcurrentHashMap.newKeySet();
-private final Map<String, AbstractButton> guardedButtons = new HashMap<>();
+**根因**　只设了 `setMaximumSize`，**没设 `setPreferredSize`**。
+BoxLayout 按**首选尺寸**摆放，而 `JComboBox` 的首选宽度由当前内容算出来 ——
+「全部」这种两字选项只有 66px。编辑区和箭头在这个宽度下就重叠了。
+另外 JButton / JComboBox / JTextField 的默认高度是 31 / 32 / 23，
+混在同一个 X_AXIS 里必然参差不齐。
 
-private boolean enterGuard(String key, String label) { ... }  // 抢不到就提示并拒绝
-private void exitGuard(String key) { ... }                   // 释放并恢复按钮
-private void runGuarded(key, label, threadName, body) { ... } // 封装「抢 → 起线程 → finally 放」
-```
+**做法**
 
-三条规则：
+- 下拉框：`barSize(c, w)` 同时定死 preferred / min / max
+- 按钮、复选框：`barH(c)` **只锁高度**（= `BAR_H` 32，取自实测最高值），
+  宽度留给 L&F —— 锁死宽度的话，主题换字体后文字会被裁掉
+- **`JTextField` 是例外**：它的 `getPreferredSize()` 按 `columns` + 字体重算，
+  **会忽略 `setPreferredSize`**。实测 `barSize(54)` 之后首选宽度仍是 59，
+  反而超过 max=54 被裁回 54，数字末尾被切掉。必须用 `setColumns(4)` 定宽
+- 组间加 `barSep()` 竖线分组；分隔线必须给固定尺寸，否则会被拉满整行
 
-1. **守卫要在所有校验之后才获取。**
-   否则某个早退分支（比如"还没抓到流量"）会把锁留在原地 —— 按钮永久禁用。
+**回归**　`ToolbarProbe`（16 条断言）真的构造一个 `RealtimeTab`，
+断言四个下拉/输入控件的宽度下限、高度一致性、以及 9 条分组竖线。
 
-2. **释放必须在 `finally` 里，且要在 EDT 上。**
-   漏掉一次就永久禁用，这是这类守卫最典型的 bug。
+**踩的坑**　探针第一版把 `MetalComboBoxButton` / `MetalScrollButton` 也算进来了
+（下拉框箭头、滚动条上下钮），误报 11 条。它们由各自的 UI 委托布局，
+必须按父链排除。另外 Swing 组件创建后 AWT 的 EDT 是非守护线程，
+`main` 返回 JVM 也不会退出 —— 探针必须自带看门狗 + `System.exit`。
 
-3. **`pinDetail` 要放在守卫之后。**
-   否则重复点击会先显示"正在后台提取…"、再显示"上一次还在运行"，
-   两条自相矛盾的提示让用户以为任务真的重启了。
+**一句话**　BoxLayout 认首选尺寸，不认最大尺寸；`JTextField` 连首选尺寸都不认。
 
-### 顺带把「OWASP Top10」按钮并进分析
-
-OWASP 是**漏洞类别**，只有和具体发现放在一起看才有意义。单独一个按钮会让人在
-"假设列表"和"OWASP 清单"之间来回对照，还容易误以为那是漏洞确认。
-
-现在：
-
-- `owaspCompact()` —— 紧凑列出命中的类别，拼在 AI 挖洞 / 本地挖洞结果末尾
-- `owaspSummary()` —— 完整覆盖度，拼进报告骨架，并随 `enrich()` 一起交给模型
-
-两处都明确标注「类别映射，不是漏洞确认」。
-
-### 回归
-
-新增 `GuardProbe`（29 条断言），静态守住：
-
-- 四个耗时功能都注册了守卫、都走 `runGuarded` / `enterGuard`
-- `runGuarded` 和 `showCveMatch` 都在 `finally` 里释放
-- `runLocalHunting` 的 `LocalHunter.hunt` 已在 `runGuarded` 之后（即不在 EDT 上）
-- `OWASP` 按钮已删除，三条分析路径都带上了归类
-
-**为什么用静态检查而不是运行期测试**：构造 `RealtimeTab` 需要 mock
-`IBurpExtenderCallbacks`，而"守卫有没有接上"本质是接线问题 —— 静态扫描更直接，
-也和既有的 `WiringProbe` 一致。
-
-### 教训
-
-**任何"点了要等几秒到几分钟"的功能，都必须同时做到三件事：**
-
-1. **有守卫** —— 不让重复触发
-2. **有反馈** —— 禁用按钮 / 状态栏提示
-3. **不占 EDT** —— 后台线程
-
-少任何一件，用户就会"再点一下试试"，而那一下往往比原来的问题更麻烦。
