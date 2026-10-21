@@ -2,7 +2,7 @@
 
 > 面向 **SRC / 众测** 的 Burp Suite 扩展：被动观察业务流量，本地识别业务逻辑漏洞，并且**保证目标数据不出本机**。
 
-**v4.3.2** · Java 21 · 34 个类 / 20,000+ 行 · 39 个测试套件 / 827 条断言全通过
+**v4.3.3** · Java 21 · 34 个类 / 20,000+ 行 · 39 个测试套件 / 830 条断言全通过
 
 ---
 
@@ -239,7 +239,7 @@ jar --list --file dist/PacketSentry-3.9.0.jar | grep '^burp/'
 ## 测试
 
 ```bash
-# 39 个套件，827 条断言
+# 39 个套件，830 条断言
 #
 # ⚠️ 如果本机有 Burp 正开着，LoadTest 和 SingleInstanceProbe 会失败 ——
 #    它们要独占 ~/.packetsentry/instance.lock，而 Burp 已经拿着它了。

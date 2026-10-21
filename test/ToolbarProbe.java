@@ -286,6 +286,57 @@ public class ToolbarProbe {
         System.out.println("        JSeparator 数量 = " + seps);
         check("至少有 6 条分组竖线（实际 " + seps + "）", seps >= 6);
 
+        // ------------------------------------------------------------
+        // ⑤ 两行必须用 WrapLayout
+        //
+        //    BoxLayout(X_AXIS) 在空间不足时不会换行，而是把组件压到 minimumSize。
+        //    高 DPI 下字体变大 → 首选宽度变大 → 必然触发，表现就是
+        //    按钮文字互相重叠、标签被裁掉半个（用户截图）。
+        //    WrapLayout 改成折行，控件始终保持首选尺寸。
+        // ------------------------------------------------------------
+        System.out.println("\n  [⑤] 工具栏两行用 WrapLayout（不能是 BoxLayout）");
+        int wrapRows = 0;
+        int boxRows = 0;
+        for (Component c : allOf(root, javax.swing.JPanel.class)) {
+            java.awt.LayoutManager lm = ((javax.swing.JPanel) c).getLayout();
+            if (lm instanceof com.packetsentry.ui.WrapLayout) {
+                wrapRows++;
+            } else if (lm instanceof javax.swing.BoxLayout
+                    && ((javax.swing.BoxLayout) lm).getAxis() == javax.swing.BoxLayout.X_AXIS) {
+                // 只统计"像工具栏行"的：子组件多且都在一行
+                if (((Container) c).getComponentCount() >= 8) {
+                    boxRows++;
+                }
+            }
+        }
+        System.out.println("        WrapLayout 面板 = " + wrapRows + "   BoxLayout(X) 面板 = " + boxRows);
+        check("工具栏行用了 WrapLayout（实际 " + wrapRows + "）", wrapRows >= 2);
+        check("没有还在用 BoxLayout(X_AXIS) 的工具栏行（实际 " + boxRows + "）", boxRows == 0);
+
+        // ------------------------------------------------------------
+        // ⑥ 按钮的 minimum 宽度不能是 0
+        //
+        //    给 0 的话，一旦某层容器判定空间不足（BoxLayout 走 minimum），
+        //    按钮会被压成 0 宽。这个断言守住"宁可折行，也不压扁"。
+        // ------------------------------------------------------------
+        System.out.println("\n  [⑥] 按钮 minimum 宽度 = preferred（不允许压到 0）");
+        List<String> collapsed = new ArrayList<>();
+        for (Component c : allOf(root, javax.swing.AbstractButton.class)) {
+            if (nestedInWidget(c)) {
+                continue;
+            }
+            JComponent jc = (JComponent) c;
+            Dimension mn = jc.getMinimumSize();
+            Dimension pf = jc.getPreferredSize();
+            if (mn.width < pf.width) {
+                collapsed.add(textOf(c) + " min.w=" + mn.width + " < pref.w=" + pf.width);
+            }
+        }
+        if (!collapsed.isEmpty()) {
+            System.out.println("        宽度可被压缩的按钮：" + collapsed);
+        }
+        check("没有按钮的 minimum 宽度小于 preferred", collapsed.isEmpty());
+
         System.out.println();
         System.out.println("============================================================");
         System.out.println(" 小计：PASS=" + pass + "  FAIL=" + fail);

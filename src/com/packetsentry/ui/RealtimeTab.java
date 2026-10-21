@@ -21,6 +21,7 @@ import com.packetsentry.detect.Pivot;
 import com.packetsentry.llm.LlmClient;
 import com.packetsentry.sanitize.Sanitizer;
 
+import javax.swing.AbstractButton;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -167,6 +168,15 @@ public final class RealtimeTab extends JPanel {
     //        否则某个早退分支（比如"还没抓到流量"）会把锁留在原地，
     //        按钮就永久禁用了。
 
+    /**
+     * 工具栏的两行。
+     *
+     * <p>存成字段是为了 {@link #refreshBarSizes()} —— 主题切换会改字体，
+     * 首选宽度随之变化，尺寸必须重锁，否则按钮又会被压扁。
+     */
+    private JPanel barRow1;
+    private JPanel barRow2;
+
     /** 正在运行的任务 key。 */
     private final java.util.Set<String> runningKeys =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -274,10 +284,18 @@ public final class RealtimeTab extends JPanel {
         return c;
     }
 
-    /** 只锁高度，宽度保持 L&F 计算结果。 */
+    /**
+     * 只锁高度，宽度保持 L&F 计算结果。
+     *
+     * <p>⚠️ minimum 宽度必须等于 preferred，<b>不能给 0</b>。
+     * 给 0 的话，一旦布局容器空间不足（BoxLayout 会走到 minimum），
+     * 按钮就会被压成 0 宽、文字互相重叠 —— 用户截图里那些糊成一团的
+     * 黑块就是这么来的。宁可让 WrapLayout 折行，也不要压扁。
+     */
     private static <T extends JComponent> T barH(T c) {
-        c.setMinimumSize(new Dimension(0, BAR_H));
-        c.setMaximumSize(new Dimension(Integer.MAX_VALUE, BAR_H));
+        Dimension pref = c.getPreferredSize();
+        c.setMinimumSize(new Dimension(pref.width, BAR_H));
+        c.setMaximumSize(new Dimension(pref.width, BAR_H));
         return c;
     }
 
@@ -294,6 +312,43 @@ public final class RealtimeTab extends JPanel {
         sep.setMinimumSize(d);
         sep.setMaximumSize(d);
         return sep;
+    }
+
+    /**
+     * 按当前字体重新锁一遍工具栏尺寸。
+     *
+     * <p>⚠️ 必须在 {@code applyTheme()} 之后调用。
+     *
+     * <p>构造期 {@code barH()} 拿到的首选宽度是按 <b>L&F 默认字体</b>算的；
+     * 主题换成等宽字体后首选宽度变大，而 minimum 还是旧值 ——
+     * 于是 minimum &lt; preferred，按钮又能被压扁。
+     * 这里按当前字体重算一遍，保证 minimum 始终等于 preferred。
+     */
+    private void refreshBarSizes() {
+        for (JPanel row : new JPanel[]{barRow1, barRow2}) {
+            if (row == null) {
+                continue;
+            }
+            for (Component c : row.getComponents()) {
+                if (c instanceof JComboBox) {
+                    // 下拉框宽度是业务固定值，只重锁高度
+                    JComponent jc = (JComponent) c;
+                    Dimension d = jc.getPreferredSize();
+                    jc.setMinimumSize(new Dimension(d.width, BAR_H));
+                    jc.setMaximumSize(new Dimension(d.width, BAR_H));
+                } else if (c instanceof JTextField) {
+                    // JTextField 的 preferred 由 columns + 字体重算，
+                    // 所以按重算后的值给 min/max，不要写死数字。
+                    JComponent jc = (JComponent) c;
+                    Dimension p = jc.getPreferredSize();
+                    jc.setMinimumSize(new Dimension(p.width, BAR_H));
+                    jc.setMaximumSize(new Dimension(Math.max(p.width + 8, 76), BAR_H));
+                } else if (c instanceof AbstractButton) {
+                    // 按钮 / 复选框：min = pref = 当前字体的首选宽度
+                    barH((JComponent) c);
+                }
+            }
+        }
     }
 
     /**
@@ -346,7 +401,16 @@ public final class RealtimeTab extends JPanel {
 
         // ---------- 第 1 行：域名过滤 + 宏观分析 ----------
         JPanel row1 = new JPanel();
-        row1.setLayout(new BoxLayout(row1, BoxLayout.X_AXIS));
+        barRow1 = row1;
+        // ⚠️ 用 WrapLayout 而不是 BoxLayout(X_AXIS)。
+        //
+        //    BoxLayout 在「首选宽度总和 > 可用宽度」时不会换行，而是把每个
+        //    组件压到 minimumSize —— 而我们给按钮的 minimum 宽度是 0，
+        //    于是按钮被压到 0 宽：文字重叠、标签被切、下拉框编辑区和箭头
+        //    叠在一起。高 DPI 下字体变大，更容易触发。
+        //
+        //    WrapLayout 改成折行：宽度不够就多排一行，控件始终保持首选尺寸。
+        row1.setLayout(new WrapLayout(java.awt.FlowLayout.LEFT, 4, 2));
         row1.setBorder(BorderFactory.createEmptyBorder(4, 6, 0, 6));
 
         // 宽度必须显式给（见 BAR_H 那段说明）
@@ -443,7 +507,6 @@ public final class RealtimeTab extends JPanel {
         row1.add(barH(domainAuditBtn));
         row1.add(barSep());
         row1.add(barH(clearBtn));
-        row1.add(Box.createHorizontalGlue());
 
         // ★ 「发现清单」放在最右、独立分组 —— 它不是一个分析动作，
         //    而是 SRC 工作的<b>主界面</b>：盯一个目标挖几天，日常就是看这个清单。
@@ -486,7 +549,8 @@ public final class RealtimeTab extends JPanel {
 
         // ---------- 第 2 行：微观控制 ----------
         JPanel row2 = new JPanel();
-        row2.setLayout(new BoxLayout(row2, BoxLayout.X_AXIS));
+        barRow2 = row2;
+        row2.setLayout(new WrapLayout(java.awt.FlowLayout.LEFT, 4, 2));
         row2.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
 
         autoBox.setToolTipText("只对「新接口结构」自动送分析；重复接口和静态资源跳过");
@@ -587,7 +651,6 @@ public final class RealtimeTab extends JPanel {
         row2.add(identityBox);
         row2.add(Box.createHorizontalStrut(4));
         row2.add(barH(acBtn));
-        row2.add(Box.createHorizontalGlue());
 
         // ---------- 表格 ----------
         table.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
@@ -990,6 +1053,7 @@ public final class RealtimeTab extends JPanel {
             // 回退：用当前 L&F 的默认色刷一遍
             revertToLaf(this);
             revertTableToLaf();
+            refreshBarSizes();
             return;
         }
         Theme.apply(this);
@@ -1007,6 +1071,8 @@ public final class RealtimeTab extends JPanel {
         //    这件事集中在一处可见 —— 而不是散在 16 个 new JButton 里，
         //    将来加按钮时也不会漏掉分级。
         applyButtonHierarchy();
+        // 主题换过字体 → 首选宽度变了 → 尺寸必须重锁
+        refreshBarSizes();
         table.repaint();
     }
 

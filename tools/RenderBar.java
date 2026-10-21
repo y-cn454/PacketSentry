@@ -68,10 +68,12 @@ public class RenderBar {
     }
 
     private static void run(String[] args) throws Exception {
-        int w = 1820;
-        int h = 190;
+        // 参数：输出 PNG、是否开主题、宽度、高度
+        // 宽度可配置是为了验证 WrapLayout 在不同窗口宽度下的折行行为。
         String outPath = args.length > 0 ? args[0] : "bar.png";
         int themeOn = args.length > 1 ? Integer.parseInt(args[1]) : 1;
+        int w = args.length > 2 ? Integer.parseInt(args[2]) : 1820;
+        int h = args.length > 3 ? Integer.parseInt(args[3]) : 260;
 
         final Object[] holder = new Object[1];
         SwingUtilities.invokeAndWait(() -> {
