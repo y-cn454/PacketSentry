@@ -2,7 +2,7 @@
 
 > 面向 **SRC / 众测** 的 Burp Suite 扩展：被动观察业务流量，本地识别业务逻辑漏洞，并且**保证目标数据不出本机**。
 
-**v3.9.0** · Java 21 · 30 个类 / 17,300+ 行 · 32 个测试套件 / 721 条断言全通过
+**v4.3.1** · Java 21 · 34 个类 / 19,900+ 行 · 38 个测试套件 / 811 条断言全通过
 
 ---
 
@@ -146,9 +146,16 @@ URL / 风险评级 / 危害说明 / 资产归属证明 / 渗透路径 / 修复�
 - **URL 和风险评级有硬兜底** —— 即使模板字段名完全陌生，报告里也一定会出现这两项
 - 每个模板都标注「按平台实际字段调整」—— 平台表单会变，不声称权威
 
-### OWASP Top 10 : 2025 覆盖度
+### OWASP Top 10 : 2025 覆盖度（已并入分析，不再单独出按钮）
 
 **刻意不做"已覆盖全部"这种表述。** 被动观察在结构上就看不到注入 / SSRF / 日志监控这几类，插件把它们明确标出来，让你知道该用什么别的办法。
+
+**v4.3.1 起不再有独立的「OWASP Top10」按钮** —— 分类只有和具体发现放在一起看才有意义，单独一份清单会让人在两处来回对照。现在：
+
+- **AI 挖洞 / 本地挖洞结果末尾**：紧凑列出本次流量命中的类别（每类最多 2 条线索）
+- **报告骨架**：附完整覆盖度说明，并一起交给模型做归类补全
+
+标注为「类别映射」而非漏洞确认 —— 是否成立仍要靠假设逐条实测。
 
 ---
 
@@ -232,16 +239,14 @@ jar --list --file dist/PacketSentry-3.9.0.jar | grep '^burp/'
 ## 测试
 
 ```bash
-# 32 个套件，721 条断言
-for t in SanitizerProbe PiiScannerProbe LoadTest RealtimeProbe LocalRulesProbe \
-         AccessControlProbe SrcModeProbe LogicHintsProbe EgressGuardProbe \
-         AuditReportProbe PlatformRulesProbe RobustnessProbe ContractProbe \
-         RouteAuditProbe ConcurrencyProbe SemanticProbe ResourceProbe \
-         TrustBoundaryProbe ReflectionProbe SrcFeedbackProbe FindingsProbe \
-         SrcToolsProbe ProviderProbe NewCodeProbe KeepAliveProbe \
-         ThemeProbe FontFixProbe SymbolProbe ButtonProbe \
-         ReportGateProbe OomDiagnoseProbe; do
-  java -Djava.awt.headless=true -cp "out:lib/*" $t || echo "FAIL: $t"
+# 38 个套件，811 条断言
+#
+# ⚠️ 如果本机有 Burp 正开着，LoadTest 和 SingleInstanceProbe 会失败 ——
+#    它们要独占 ~/.packetsentry/instance.lock，而 Burp 已经拿着它了。
+#    这不是代码问题。换个临时 home 即可验证：
+#      java -Duser.home=/tmp/pscheck -cp "out:lib/*" SingleInstanceProbe
+for t in $(ls test/*.java | xargs -n1 basename | sed 's/\.java$//'); do
+  java -Djava.awt.headless=true -cp "out:lib/*" $t src || echo "FAIL: $t"
 done
 ```
 

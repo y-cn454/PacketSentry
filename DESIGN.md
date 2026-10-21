@@ -784,3 +784,99 @@ return f.getName().equalsIgnoreCase("Monospaced")
 「属性 InitialSize 的类型不匹配」，而 `wmic` 已从这个 Windows 版本移除。
 **直接写注册表** `PagingFiles`（`REG_MULTI_SZ`）是唯一可靠的路。
 而且**页面文件改动必须重启**才生效。
+
+---
+
+## 20. 耗时功能必须有**单飞守卫**，否则"再点一下"就是重复请求
+
+### 现象
+
+用户反馈三件事：
+
+1. **「AI 挖洞一直在请求模型」**
+2. **「CVE 匹配和本地挖洞也可能存在类似 bug」**
+3. **「OWASP Top10 要结合到分析中，不要单独一个按钮」**
+
+### 根因
+
+前两条是同一个问题：**没有防重入**。
+
+```java
+huntBtn.addActionListener(e -> runHunting());   // 每次点击都起一个新线程
+// runHunting 内部：
+//   new Thread(() -> llm.chat(cfg, SYSTEM, prompt)).start();
+// 没有「正在跑」的标记，也没有禁用按钮
+```
+
+本地 4B 模型处理一份完整 prompt 要 **30–120 秒**，期间界面上没有任何反馈。
+用户以为没反应就反复点 —— **点 5 次就是 5 个并发请求，每个都是全量 prompt**。
+在 Burp 的 HTTP history 里看，就是"一直在请求模型"，而本地模型会被打爆（排队 / OOM）。
+
+更糟的是 `runLocalHunting`：它是**同步跑在 EDT 上**的。
+
+```java
+com.packetsentry.ai.LocalHunter.Result res =
+        com.packetsentry.ai.LocalHunter.hunt(pool);   // 800 条记录 = 5 秒以上
+```
+
+这 5 秒里界面完全冻住，连"正在跑"都画不出来。
+
+### 决定
+
+引入**单飞守卫（single-flight guard）**：同一个功能同一时刻只允许一个任务。
+
+```java
+private final Set<String> runningKeys = ConcurrentHashMap.newKeySet();
+private final Map<String, AbstractButton> guardedButtons = new HashMap<>();
+
+private boolean enterGuard(String key, String label) { ... }  // 抢不到就提示并拒绝
+private void exitGuard(String key) { ... }                   // 释放并恢复按钮
+private void runGuarded(key, label, threadName, body) { ... } // 封装「抢 → 起线程 → finally 放」
+```
+
+三条规则：
+
+1. **守卫要在所有校验之后才获取。**
+   否则某个早退分支（比如"还没抓到流量"）会把锁留在原地 —— 按钮永久禁用。
+
+2. **释放必须在 `finally` 里，且要在 EDT 上。**
+   漏掉一次就永久禁用，这是这类守卫最典型的 bug。
+
+3. **`pinDetail` 要放在守卫之后。**
+   否则重复点击会先显示"正在后台提取…"、再显示"上一次还在运行"，
+   两条自相矛盾的提示让用户以为任务真的重启了。
+
+### 顺带把「OWASP Top10」按钮并进分析
+
+OWASP 是**漏洞类别**，只有和具体发现放在一起看才有意义。单独一个按钮会让人在
+"假设列表"和"OWASP 清单"之间来回对照，还容易误以为那是漏洞确认。
+
+现在：
+
+- `owaspCompact()` —— 紧凑列出命中的类别，拼在 AI 挖洞 / 本地挖洞结果末尾
+- `owaspSummary()` —— 完整覆盖度，拼进报告骨架，并随 `enrich()` 一起交给模型
+
+两处都明确标注「类别映射，不是漏洞确认」。
+
+### 回归
+
+新增 `GuardProbe`（29 条断言），静态守住：
+
+- 四个耗时功能都注册了守卫、都走 `runGuarded` / `enterGuard`
+- `runGuarded` 和 `showCveMatch` 都在 `finally` 里释放
+- `runLocalHunting` 的 `LocalHunter.hunt` 已在 `runGuarded` 之后（即不在 EDT 上）
+- `OWASP` 按钮已删除，三条分析路径都带上了归类
+
+**为什么用静态检查而不是运行期测试**：构造 `RealtimeTab` 需要 mock
+`IBurpExtenderCallbacks`，而"守卫有没有接上"本质是接线问题 —— 静态扫描更直接，
+也和既有的 `WiringProbe` 一致。
+
+### 教训
+
+**任何"点了要等几秒到几分钟"的功能，都必须同时做到三件事：**
+
+1. **有守卫** —— 不让重复触发
+2. **有反馈** —— 禁用按钮 / 状态栏提示
+3. **不占 EDT** —— 后台线程
+
+少任何一件，用户就会"再点一下试试"，而那一下往往比原来的问题更麻烦。

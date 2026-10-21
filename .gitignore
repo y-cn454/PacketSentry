@@ -37,3 +37,5 @@ replay_pid*.log
 _sym*.txt
 symbol-report.txt
 *.log
+
+out-test/

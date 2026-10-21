@@ -144,6 +144,104 @@ public final class RealtimeTab extends JPanel {
      */
     private volatile PlatformRules.Parsed platformRules = new PlatformRules.Parsed();
 
+    // ==================== 单飞守卫 ====================
+    //
+    // ⚠️ 为什么必须有这一块：
+    //
+    //     AI 挖洞 / 本地挖洞 / CVE 匹配 / 业务逻辑分析都是「起后台线程 + 全量扫一遍」。
+    //     本地 4B 模型处理一份完整 prompt 要 30–120 秒，而界面上没有任何
+    //     "正在跑"的反馈 —— 用户以为没反应就会反复点。
+    //
+    //     没有守卫时的后果（用户实测反馈"AI 挖洞一直在请求模型"）：
+    //       · 点 5 次 = 并发 5 个请求，而且每个请求都是全量 prompt
+    //       · 本地模型会被打爆（排队 / OOM），看起来像"卡死 + 一直请求"
+    //       · CVE 匹配和本地挖洞同理：多次点击会起多个线程同时扫全量记录
+    //
+    //     现在的规则：同一个功能同一时刻只跑一个任务。
+    //     重复点击直接拒绝并说明原因，同时把按钮禁用 —— 让用户看得见"在跑"。
+    //
+    //     ⚠️ 关键设计：守卫要在<b>所有校验之后</b>才获取。
+    //        否则某个早退分支（比如"还没抓到流量"）会把锁留在原地，
+    //        按钮就永久禁用了。
+
+    /** 正在运行的任务 key。 */
+    private final java.util.Set<String> runningKeys =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** key → 受保护的按钮（用于禁用/恢复）。 */
+    private final java.util.Map<String, javax.swing.AbstractButton> guardedButtons =
+            new java.util.HashMap<>();
+
+    /** 注册一个受守卫保护的按钮（必须在构造时调用）。 */
+    private void guardButton(String key, javax.swing.AbstractButton btn) {
+        if (key != null && btn != null) {
+            guardedButtons.put(key, btn);
+        }
+    }
+
+    /**
+     * 尝试进入一个受守卫的任务。
+     *
+     * @param key   任务标识
+     * @param label 显示给用户的功能名
+     * @return true = 拿到执行权；false = 已有同类任务在跑（已向用户说明）
+     */
+    private boolean enterGuard(String key, String label) {
+        if (!runningKeys.add(key)) {
+            pinDetail("══════════ " + label + " ══════════\n\n"
+                    + "⟳ 上一次任务还在运行，本次点击已忽略。\n\n"
+                    + "▲ 同一个功能同一时刻只跑一个任务 ——\n"
+                    + "  这是为了防止对本地模型发重复请求 / 重复全量扫描。\n\n"
+                    + "  本地模型生成一份假设通常要 30–120 秒，\n"
+                    + "  请等状态栏的提示出现后再点。\n");
+            return false;
+        }
+        javax.swing.AbstractButton b = guardedButtons.get(key);
+        if (b != null) {
+            b.setEnabled(false);
+        }
+        return true;
+    }
+
+    /**
+     * 退出守卫并恢复按钮。
+     *
+     * <p>⚠️ 必须在 finally 里调用，并且要在 EDT 上（按钮操作）。
+     * 漏掉一次，按钮就永久禁用 —— 这是这类守卫最典型的 bug。
+     */
+    private void exitGuard(String key) {
+        runningKeys.remove(key);
+        javax.swing.AbstractButton b = guardedButtons.get(key);
+        if (b != null) {
+            b.setEnabled(true);
+        }
+    }
+
+    /**
+     * 在后台线程上跑一个受守卫保护的任务，结束时自动释放守卫。
+     *
+     * <p>把「获取守卫 → 起线程 → finally 释放」这套样板收敛到一处，
+     * 避免每个功能都手写一遍、漏掉某条早退路径。
+     */
+    private void runGuarded(String key, String label, String threadName, Runnable body) {
+        if (!enterGuard(key, label)) {
+            return;
+        }
+        Thread th = new Thread(() -> {
+            try {
+                body.run();
+            } catch (Throwable t) {
+                SwingUtilities.invokeLater(() -> pinDetail(
+                        "══════════ " + label + " ══════════\n\n"
+                                + "× 任务异常终止：" + t + "\n"));
+            } finally {
+                SwingUtilities.invokeLater(() -> exitGuard(key));
+            }
+        }, threadName);
+        th.setDaemon(true);
+        th.start();
+    }
+
     /**
      * 发现清单 —— SRC 工作的载体。
      *
@@ -191,10 +289,12 @@ public final class RealtimeTab extends JPanel {
                 "从抓到的流量里生成可验证的漏洞假设（不是直接判定漏洞）"
                         + " —— 每条都必须过黄金六要素闸门才能进报告");
         huntBtn.addActionListener(e -> runHunting());
+        guardButton("hunt", huntBtn);
         localHuntBtn.setToolTipText(
                 "用本地规则从流量里找线索（越权/未授权/篡改/信息泄露）"
                         + " —— 纯本地，0 网络请求，SRC 模式下也能用");
         localHuntBtn.addActionListener(e -> runLocalHunting());
+        guardButton("localHunt", localHuntBtn);
         reviewBtn.setToolTipText(
                 "逐条标记假设的验证结果 —— 只有「已证实」的才够格写进报告");
         reviewBtn.addActionListener(e -> reviewHypotheses());
@@ -205,6 +305,7 @@ public final class RealtimeTab extends JPanel {
 
         macroAiBtn.setToolTipText("把业务地图发给 AI 做一次业务逻辑推断（约 ¥0.01-0.03，单次调用）");
         macroAiBtn.addActionListener(e -> showBusinessMap(true));
+        guardButton("businessAi", macroAiBtn);
 
         JButton clearBtn = new JButton("清空");
         clearBtn.addActionListener(e -> {
@@ -241,9 +342,16 @@ public final class RealtimeTab extends JPanel {
                 "审计已抓到的该域名所有 JS/HTML —— 纯本地字符串分析，发送 0 个网络请求，不会触发 WAF");
         domainAuditBtn.addActionListener(e -> auditDomain());
 
-        JButton owaspBtn = new JButton("OWASP Top10");
-        owaspBtn.setToolTipText("按当前流量显示 OWASP Top 10 的真实覆盖度（含「本工具测不了」的明确标注）");
-        owaspBtn.addActionListener(e -> showOwasp());
+        // ⚠️ 已删除独立的「OWASP Top10」按钮。
+        //
+        //    原因（用户反馈）：OWASP 分类应该在分析结果里**结合着看**，
+        //    而不是单独点一个按钮生成一份孤立的清单 —— 那样用户得来回对照，
+        //    看不出「这条假设对应哪一类风险」。
+        //
+        //    现在 OWASP 映射合并进：
+        //      · AI 挖洞结果的末尾（每条假设标注所属类别）
+        //      · 报告生成（按 OWASP 分类归组）
+        //    见 onHuntResult() 与 ReportGenerator。
 
         row1.add(new JLabel("目标域名 "));
         row1.add(hostBox);
@@ -257,8 +365,6 @@ public final class RealtimeTab extends JPanel {
         row1.add(reflectBtn);
         row1.add(Box.createHorizontalStrut(4));
         row1.add(domainAuditBtn);
-        row1.add(Box.createHorizontalStrut(4));
-        row1.add(owaspBtn);
         row1.add(Box.createHorizontalStrut(10));
         row1.add(clearBtn);
         row1.add(Box.createHorizontalGlue());
@@ -290,6 +396,7 @@ public final class RealtimeTab extends JPanel {
                         + " 你核实并登记 CVE 区间后，一次匹配全部同指纹资产。"
                         + " 纯被动分析，0 网络请求");
         cveBtn.addActionListener(e -> showCveMatch());
+        guardButton("cve", cveBtn);
         row1.add(cveBtn);
         row1.add(localHuntBtn);
         row1.add(huntBtn);
@@ -1654,6 +1761,17 @@ public final class RealtimeTab extends JPanel {
         String host = selectedHost();
         final List<PacketRecord> snap = pipe.snapshot();
 
+        // ⚠️ 单飞守卫：这个功能会全量扫一遍所有响应体提取组件指纹。
+        //    没有守卫时反复点击会并发多个线程同时扫，既浪费 CPU，
+        //    也让后一次的结果覆盖前一次（用户以为"结果一直在变"）。
+        //
+        //    ▲ 守卫必须放在 pinDetail <b>之前</b>：
+        //      否则重复点击时会先显示"正在后台提取…"、再显示"上一次还在运行"，
+        //      两条自相矛盾的提示会让用户以为任务真的重启了。
+        if (!enterGuard("cve", "CVE 匹配")) {
+            return;
+        }
+
         pinDetail("══════════ CVE × 资产匹配 ══════════\n\n"
                 + "目标域名：" + (host == null ? "(全部)" : host) + "\n"
                 + "已抓记录：" + snap.size() + " 条\n\n"
@@ -1661,6 +1779,7 @@ public final class RealtimeTab extends JPanel {
                 + "（扫描在后台线程做，抓包多也不会卡界面）");
 
         Thread t = new Thread(() -> {
+          try {
             com.packetsentry.vuln.ComponentIndex index =
                     new com.packetsentry.vuln.ComponentIndex();
             int fed = 0;
@@ -1688,6 +1807,13 @@ public final class RealtimeTab extends JPanel {
             final com.packetsentry.vuln.ComponentIndex idxFinal = index;
             SwingUtilities.invokeLater(() -> showCveResult(idxFinal, fedFinal,
                     skippedFinal, host));
+          } catch (Throwable ex) {
+            SwingUtilities.invokeLater(() -> pinDetail(
+                    "══════════ CVE × 资产匹配 ══════════\n\n"
+                            + "× 扫描异常终止：" + ex + "\n"));
+          } finally {
+            SwingUtilities.invokeLater(() -> exitGuard("cve"));
+          }
         }, "packetsentry-cve-scan");
         t.setDaemon(true);
         t.start();
@@ -2273,15 +2399,64 @@ public final class RealtimeTab extends JPanel {
     // ==================================================================
 
     /**
-     * 显示 OWASP Top 10 的真实覆盖度。
+     * OWASP Top 10 的<b>完整</b>覆盖度报告（含"本工具测不了"的明确标注）。
+     *
+     * <p>⚠️ 以前这是一个独立按钮（showOwasp），用户在分析结果和 OWASP 清单之间
+     * 来回对照，看不出「这条假设属于哪一类风险」。现在改为：
+     * <ul>
+     *   <li>分析结果末尾用 {@link #owaspCompact()} 紧凑列出命中的类别</li>
+     *   <li>报告生成时用本方法附完整覆盖度说明</li>
+     * </ul>
      *
      * <p>刻意<b>不做</b>「已覆盖全部」这种表述 —— 被动观察结构上就看不到
      * 注入 / SSRF / 日志监控这三类。明确标出来，用户才知道该用什么别的办法。
      */
-    private void showOwasp() {
+    private String owaspSummary() {
         List<PacketRecord> all = pipe.snapshot();
+        if (all == null || all.isEmpty()) {
+            return "";
+        }
         List<OwaspTop10.Category> cats = OwaspTop10.evaluate(all);
-        pinDetail(OwaspTop10.render(cats, all.size()));
+        return OwaspTop10.render(cats, all.size());
+    }
+
+    /**
+     * OWASP Top 10 的<b>紧凑</b>摘要 —— 只列本次流量里「有线索」的类别。
+     *
+     * <p>用途：拼在 AI 挖洞 / 本地挖洞的结果末尾，让每条假设都能对上风险类别。
+     * 没有命中任何类别时返回空串（调用方据此跳过这一节）。
+     */
+    private String owaspCompact() {
+        List<PacketRecord> all = pipe.snapshot();
+        if (all == null || all.isEmpty()) {
+            return "";
+        }
+        List<OwaspTop10.Category> cats = OwaspTop10.evaluate(all);
+        int hitCats = 0;
+        StringBuilder body = new StringBuilder();
+        for (OwaspTop10.Category c : cats) {
+            if (c.hits == null || c.hits.isEmpty()) {
+                continue;
+            }
+            hitCats++;
+            body.append("  ").append(c.id).append(' ').append(c.name)
+                    .append("　").append(c.hits.size()).append(" 条线索\n");
+            int shown = 0;
+            for (String h : c.hits) {
+                if (shown >= 2) {
+                    body.append("      …… 另有 ").append(c.hits.size() - 2).append(" 条\n");
+                    break;
+                }
+                body.append("      · ").append(h).append('\n');
+                shown++;
+            }
+        }
+        if (hitCats == 0) {
+            return "";
+        }
+        return "── OWASP Top 10:2025 归类（" + hitCats + " 类有线索）──\n"
+                + body
+                + "\n▲ 这是<b>类别映射</b>，不是漏洞确认 —— 是否成立要看上面的假设逐条验证。\n";
     }
     private void runCodeAudit() {
         PacketRecord r = selected();
@@ -2375,6 +2550,17 @@ public final class RealtimeTab extends JPanel {
         }
 
         String skeleton = reportGen.buildSkeleton(targets, cfg);
+
+        // ⭐ OWASP Top 10 覆盖度并进报告骨架（不再需要用户单独点按钮）。
+        //
+        //    这样两件事同时成立：
+        //      · 报告里能看到「本次会话对应哪些风险类别」
+        //      · enrich() 会把这一段一起交给模型，模型可以据此补全归类
+        //        —— 这正是「OWASP 结合到分析中」的意思，而不是一份孤立清单。
+        String owaspFull = owaspSummary();
+        if (!owaspFull.isEmpty()) {
+            skeleton = skeleton + "\n\n" + owaspFull;
+        }
 
         // ▲ 这个判断改过一版，修的是一个「报告张冠李戴」的 bug。
         //
@@ -3226,15 +3412,15 @@ public final class RealtimeTab extends JPanel {
                 + "（这一步只产生假设，不会替你发任何请求）\n");
 
         final String dom = host;
-        Thread th = new Thread(() -> {
+        // ⚠️ 必须走 runGuarded：没有守卫时反复点击会并发多个模型请求
+        //    （本地模型一次 30-120 秒，用户看到的正是"一直在请求模型"）。
+        runGuarded("hunt", "AI 挖洞", "packetsentry-hunt", () -> {
             String prompt = com.packetsentry.ai.HuntingEngine.buildPrompt(facts, dom);
             LlmClient.Reply reply = llm.chat(cfg,
                     "你是渗透测试专家，只提出可验证的假设，绝不声称已验证任何漏洞。",
                     prompt);
             SwingUtilities.invokeLater(() -> onHuntResult(reply, facts, dom));
-        }, "packetsentry-hunt");
-        th.setDaemon(true);
-        th.start();
+        });
     }
 
     /** 处理 AI 返回的假设。 */
@@ -3290,6 +3476,13 @@ public final class RealtimeTab extends JPanel {
             com.packetsentry.ai.Hypothesis h = pr.hypotheses.get(i);
             sb.append(i + 1).append(". ").append(h.render()).append("\n\n");
         }
+        // ⭐ OWASP 归类合并进结果（不再需要单独点按钮）
+        String owasp = owaspCompact();
+        if (!owasp.isEmpty()) {
+            sb.append(owasp);
+            sb.append('\n');
+        }
+
         sb.append("══════════ 下一步 ══════════\n");
         sb.append("这些是<b>假设</b>，不是发现。请逐条手工验证：\n");
         sb.append("  · 按「验证步骤」在授权目标上实际发请求\n");
@@ -3486,8 +3679,24 @@ public final class RealtimeTab extends JPanel {
             return;
         }
 
-        com.packetsentry.ai.LocalHunter.Result res =
-                com.packetsentry.ai.LocalHunter.hunt(pool);
+        // ⚠️ 以前这里是【同步】执行：LocalHunter.hunt() 跑在 EDT 上。
+        //    实测 800 条记录要 5 秒以上，期间界面完全冻结 —— 这正是
+        //    用户反馈的"本地挖洞可能也有类似 bug"（不是请求模型，是卡界面）。
+        //    而且 EDT 忙时点击会排队，恢复后连续执行多次。
+        //    现在改为后台线程 + 单飞守卫，界面全程可响应。
+        final String hostF = host;
+        final java.util.List<PacketRecord> poolF = pool;
+        runGuarded("localHunt", "本地挖洞", "packetsentry-local-hunt", () -> {
+            com.packetsentry.ai.LocalHunter.Result r =
+                    com.packetsentry.ai.LocalHunter.hunt(poolF);
+            SwingUtilities.invokeLater(() -> showLocalHuntResult(r, poolF, hostF));
+        });
+    }
+
+    /** 渲染本地挖洞结果（在 EDT 上调用）。 */
+    private void showLocalHuntResult(com.packetsentry.ai.LocalHunter.Result res,
+                                     java.util.List<PacketRecord> pool,
+                                     String host) {
         lastHypotheses = res.hypotheses;
 
         StringBuilder sb = new StringBuilder();
@@ -3521,6 +3730,13 @@ public final class RealtimeTab extends JPanel {
             sb.append(i + 1).append(". ").append(res.hypotheses.get(i).render())
                     .append("\n\n");
         }
+        // ⭐ OWASP 归类合并进结果（与 AI 挖洞保持一致，不单独出按钮）
+        String owasp = owaspCompact();
+        if (!owasp.isEmpty()) {
+            sb.append(owasp);
+            sb.append('\n');
+        }
+
         sb.append("══════════ 下一步 ══════════\n");
         sb.append("这些是<b>线索</b>，不是发现。请按「验证步骤」逐条实测：\n");
         sb.append("  · 对照「判据」判断是否成立\n");
