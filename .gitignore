@@ -39,3 +39,7 @@ symbol-report.txt
 *.log
 
 out-test/
+
+# 构建中间产物（javac @file / jar manifest）
+_srcs.txt
+_manifest.txt

@@ -102,6 +102,17 @@ public final class SettingsPanel extends JPanel {
 
     private final JTextArea logArea = new JTextArea(6, 70);
     private final JCheckBox srcModeBox = new JCheckBox("启用 SRC 安全模式（强制本地模型，数据不出本机）");
+    /**
+     * 「SRC 模式挡掉了云端」的醒目提示。
+     *
+     * <p>▲ 加这个是因为真实用户报障：「我已经切到 deepseek 云端了，它还是在 ollama 里跑」。
+     * 行为本身是对的（{@code enforceSrcMode()} 把云端改回本地），但原实现只在
+     * 保存后的日志里留一行 —— 用户根本不会往那儿看，于是以为<b>切换坏了</b>。
+     * 现在改成：选云端的那一刻就当场拦住，并把原因写在服务商下拉框正下方。
+     */
+    private final JLabel srcBlockLabel = new JLabel(" ");
+    /** 防递归：回填下拉框会再次触发 applyPreset()。 */
+    private boolean applyingPreset = false;
     /** 目标 SRC 平台名称 + 评级规则原文 + 署名。 */
     /**
      * 靶场模式。默认关（= 实战 SRC）。
@@ -305,6 +316,25 @@ public final class SettingsPanel extends JPanel {
             providerBox.addItem(p[0]);
         }
         providerBox.addActionListener(e -> applyPreset());
+        // ⭐ SRC 模式下把云端项渲染成灰色 —— 让用户在选择之前就看见"这些不可用"。
+        providerBox.setRenderer(new javax.swing.DefaultListCellRenderer() {
+            @Override
+            public java.awt.Component getListCellRendererComponent(
+                    javax.swing.JList<?> list, Object value, int index,
+                    boolean isSelected, boolean cellHasFocus) {
+                java.awt.Component c = super.getListCellRendererComponent(
+                        list, value, index, isSelected, cellHasFocus);
+                int idx = index >= 0 ? index : providerBox.getSelectedIndex();
+                boolean cloud = idx >= 0 && idx < PRESETS.length && !isLocalPreset(PRESETS[idx]);
+                if (cloud && srcModeBox.isSelected()) {
+                    c.setForeground(new java.awt.Color(0x99, 0x99, 0x99));
+                    if (!isSelected) {
+                        c.setBackground(list.getBackground());
+                    }
+                }
+                return c;
+            }
+        });
         addRow(form, gc, row++, "服务商", providerBox);
 
         addRow(form, gc, row++, "Base URL", baseUrlField);
@@ -329,6 +359,11 @@ public final class SettingsPanel extends JPanel {
                         + "自动分析只会被默认关掉（可自行开回，本地模型下没有外传风险）");
         srcHint.setForeground(new java.awt.Color(0x55, 0x55, 0x55));
         addFullRow(form, gc, row++, srcHint);
+
+        srcBlockLabel.setForeground(new java.awt.Color(0xC0, 0x20, 0x20));
+        srcBlockLabel.setFont(srcBlockLabel.getFont().deriveFont(Font.BOLD));
+        addFullRow(form, gc, row++, srcBlockLabel);
+
         srcModeBox.addActionListener(e -> onSrcModeToggled());
 
         addFullRow(form, gc, row++, separator("脱敏策略"));
@@ -489,6 +524,29 @@ public final class SettingsPanel extends JPanel {
             return;
         }
         String[] p = PRESETS[i];
+
+        // ⭐ SRC 安全模式开着时，云端服务商当场拒绝切换。
+        //
+        //    以前不拦：用户选了 DeepSeek、填了密钥、点保存 —— enforceSrcMode()
+        //    再把 provider/baseUrl/model 静默改回 ollama。用户看到"已保存"，
+        //    实际配置没变，于是以为切换功能坏了。现在在【选择这一刻】就说明白。
+        if (srcModeBox.isSelected() && !isLocalPreset(p)) {
+            if (!applyingPreset) {
+                log("▲ 「" + p[0] + "」属于云端服务商，SRC 安全模式要求本地模型，已拒绝切换。");
+                log("  要用云端：先取消勾选「启用 SRC 安全模式」，再选服务商、保存。");
+                log("  （SRC 规则通常禁止把业务报文交给第三方 —— 这不是插件的限制。）");
+                // 把下拉框退回配置里的真实服务商，避免"界面显示云端、实际跑本地"
+                applyingPreset = true;
+                try {
+                    loadProviderSelectionOnly();
+                } finally {
+                    applyingPreset = false;
+                }
+                refreshSrcBlockHint();
+            }
+            return;
+        }
+
         if (!"custom".equals(p[1])) {
             baseUrlField.setText(p[2]);
             if (modelField.getText().trim().isEmpty() || !"custom".equals(p[1])) {
@@ -508,6 +566,55 @@ public final class SettingsPanel extends JPanel {
             modelField.setToolTipText(null);
         }
         refreshDestination();
+    }
+
+    /** 这个预设是不是本地服务商？{@code PRESETS[i][4]=="1"} 表示本地。 */
+    private static boolean isLocalPreset(String[] p) {
+        return p != null && p.length > 4 && "1".equals(p[4]);
+    }
+
+    /**
+     * 只回填「服务商下拉框」，不动其他输入框。
+     *
+     * <p>用在「SRC 模式下拒绝切云端」时把下拉框退回真实值 ——
+     * 若调 {@link #loadIntoForm()} 会把用户正在编辑的密钥/超时也冲掉。
+     */
+    private void loadProviderSelectionOnly() {
+        Config c = configSupplier.get();
+        int sel = PRESETS.length - 1;
+        for (int i = 0; i < PRESETS.length; i++) {
+            if (PRESETS[i][1].equals(c.provider)) {
+                sel = i;
+                break;
+            }
+        }
+        providerBox.setSelectedIndex(sel);
+    }
+
+    /**
+     * 刷新「SRC 模式挡掉了云端」这一行提示。
+     *
+     * <p>三种状态：
+     * <ul>
+     *   <li>SRC 关 → 空白</li>
+     *   <li>SRC 开 + 选中云端（理论上已被拦住，这里兜底）→ 红字说明会被强制改回</li>
+     *   <li>SRC 开 + 选中本地 → 说明云端项为何是灰的</li>
+     * </ul>
+     */
+    private void refreshSrcBlockHint() {
+        if (!srcModeBox.isSelected()) {
+            srcBlockLabel.setText(" ");
+            return;
+        }
+        int i = providerBox.getSelectedIndex();
+        boolean cloud = i >= 0 && i < PRESETS.length && !isLocalPreset(PRESETS[i]);
+        if (cloud) {
+            srcBlockLabel.setText("▲ SRC 安全模式要求本地模型：「" + PRESETS[i][0]
+                    + "」是云端，保存时会被强制改回 Ollama。要用云端请先关掉 SRC 安全模式。");
+        } else {
+            srcBlockLabel.setText("SRC 安全模式已开启：只能使用本地模型"
+                    + "（列表中的云端项已变灰，选中会被拒绝）。");
+        }
     }
 
     /**
@@ -548,6 +655,7 @@ public final class SettingsPanel extends JPanel {
         apiKeyEnvField.setText(c.apiKeyEnv);
         apiKeyInlineField.setText(c.apiKeyInline);
         srcModeBox.setSelected(c.srcMode);
+        refreshSrcBlockHint();
         rangeModeBox.setSelected(c.rangeMode);
         com.packetsentry.report.ReportTemplate cur =
                 com.packetsentry.report.ReportTemplate.byId(c.reportTemplateId);
@@ -810,11 +918,16 @@ public final class SettingsPanel extends JPanel {
         Config c = configSupplier.get();
         c.srcMode = srcModeBox.isSelected();
         if (!c.srcMode) {
+            srcBlockLabel.setText(" ");
+            providerBox.repaint();
             log("已关闭 SRC 安全模式 —— 数据可能离开本机，请自行确认合规性");
+            log("  现在可以选择云端服务商了（选完记得点「保存」）。");
             return;
         }
         java.util.List<String> forced = c.enforceSrcMode();
         loadIntoForm();
+        providerBox.repaint();
+        refreshSrcBlockHint();
         log("── 已开启 SRC 安全模式 ──");
         if (forced.isEmpty()) {
             log("当前配置本来就合规，未做修改");
@@ -849,6 +962,9 @@ public final class SettingsPanel extends JPanel {
             for (String s : forced) {
                 log("  " + s);
             }
+            // ⭐ 把"为什么被改回"直接摆到服务商下方，而不是只留在日志里
+            srcBlockLabel.setText("▲ 刚才的保存被 SRC 安全模式修正了：云端服务商不能用于 SRC 测试。"
+                    + "要用云端请先取消勾选「启用 SRC 安全模式」。");
         }
 
         String err = c.save();

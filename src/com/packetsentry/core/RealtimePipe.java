@@ -366,7 +366,20 @@ public final class RealtimePipe {
         //    早期版本把「有响应就用响应」当成分析对象，结果 brief 变成了
         //    「从响应体提参数名 + 响应体当请求体」，完全错位。
         String reqRaw = j.request == null ? "" : new String(j.request, StandardCharsets.UTF_8);
-        String respRaw = j.response == null ? "" : new String(j.response, StandardCharsets.UTF_8);
+
+        // ⚠️ 二进制响应<b>不能</b>转成字符串参与扫描。
+        //
+        //    实测漏过一个 HLS 视频分片：
+        //      GET mts.xxx.mobi/video5/xxx.ts   Content-Type: binary/octet-stream
+        //    它的 MIME 不是 video/*（所以 isLowValue 放过了），扩展名 .ts 也有歧义
+        //    （HLS 视频分片 / TypeScript 都用它）。于是它被：
+        //      ① 当成 UTF-8 字符串扫了一遍 —— 二进制里恰好有 `<%=` → 误报「源码泄露」
+        //      ② 整段塞进 AI prompt —— 模型吃进一堆乱码，请求直接失败
+        //    所以先用字节判断，二进制就一律当空响应对待。
+        boolean respBinary = hasResp && looksBinary(j.response);
+        String respRaw = respBinary
+                ? ""
+                : (j.response == null ? "" : new String(j.response, StandardCharsets.UTF_8));
 
         Meta meta = parseMeta(hasResp ? reqRaw : new String(msg, StandardCharsets.UTF_8), true);
         if (hasResp) {
@@ -424,7 +437,8 @@ public final class RealtimePipe {
             brief = brief + "\n\n" + pivotText;
         }
 
-        boolean lowValue = isLowValue(meta, cfg);
+        // ⭐ 二进制响应一律算低价值 —— 它既不会被本地规则分析，也不该送去 AI。
+        boolean lowValue = isLowValue(meta, cfg) || respBinary;
 
         // ▲ 低价值报文<b>不进去重表</b>。
         //    实测发现：600 个 /static/chunk{n}.js 虽然都被正确判为低价值，
@@ -677,12 +691,67 @@ public final class RealtimePipe {
         }
         return false;
     }
+    /**
+     * 这段原始报文看起来是不是二进制？
+     *
+     * <h3>为什么必须看字节，不能只看 Content-Type / 扩展名</h3>
+     *
+     * 实测漏过一个 HLS 视频分片：{@code mts.xxx.mobi/video5/xxx.ts}，
+     * 它的 {@code Content-Type} 是 {@code binary/octet-stream}（不是 {@code video/*}），
+     * 扩展名 {@code .ts} 又有歧义（视频分片 / TypeScript 都用）。
+     * 结果它一路过关：
+     * <ol>
+     *   <li>被转成 UTF-8 字符串扫了一遍 → 二进制里恰好出现 {@code <%=} →
+     *       误报「源码泄露」（高危）</li>
+     *   <li>被整段拼进 AI prompt → 模型吃进乱码，请求直接失败</li>
+     * </ol>
+     *
+     * <p>MIME 和扩展名都能骗人，字节本身不会。判据：
+     * <ul>
+     *   <li><b>出现 NUL 字节</b> —— 文本（含 UTF-8 中文）里不可能有，直接判二进制</li>
+     *   <li>其他控制字符（除 \t \n \r）占比 &gt; 10% —— 判二进制</li>
+     * </ul>
+     *
+     * <p>结论偏保守：宁可把少数不寻常的文本误判成二进制（代价是少分析一个包），
+     * 也不要把二进制当文本（代价是误报 + AI 调用失败）。
+     */
+    static boolean looksBinary(byte[] buf) {
+        if (buf == null || buf.length == 0) {
+            return false;
+        }
+        // 只看前面一段 —— 二进制文件的头部通常已经足够判断
+        int n = Math.min(buf.length, 1024);
+        int ctrl = 0;
+        for (int i = 0; i < n; i++) {
+            int b = buf[i] & 0xFF;
+            if (b == 0x09 || b == 0x0A || b == 0x0D) {
+                continue;              // 制表 / 换行 / 回车是正常文本
+            }
+            if (b == 0x00) {
+                return true;           // ⭐ NUL：最可靠的二进制信号
+            }
+            if (b < 0x20) {
+                ctrl++;                // 其他控制字符
+            }
+        }
+        return ctrl * 100 / n > 10;
+    }
+
     static boolean isLowValue(Meta meta, Config cfg) {
         String path = meta.path == null ? "" : meta.path.toLowerCase();
         String mime = meta.mime == null ? "" : meta.mime.toLowerCase();
 
+        // ⚠️ 这里必须覆盖 binary/ 和 octet-stream：
+        //    视频流分片、下载文件常报 `binary/octet-stream`，
+        //    它既不是 video/* 也不是 audio/*，会从上面那行漏过去。
         if (mime.startsWith("image/") || mime.startsWith("font/")
-                || mime.startsWith("audio/") || mime.startsWith("video/")) {
+                || mime.startsWith("audio/") || mime.startsWith("video/")
+                || mime.startsWith("binary/")
+                || mime.contains("octet-stream")
+                || mime.contains("application/zip")
+                || mime.contains("application/pdf")
+                || mime.contains("application/x-protobuf")
+                || mime.contains("application/wasm")) {
             return true;
         }
         if (mime.contains("css") || mime.contains("javascript")) {
